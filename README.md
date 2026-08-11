@@ -28,3 +28,7 @@ Use this cron line to run every day at 07:00 and save the log:
 - The script stores session cookies locally, so it can reuse the login.
 - We do not know how long the session will stay valid.
 - If the saved session expires, run the script manually again and enter a new OTP.
+- In case you are using gmail, create an "App password" for the email sender. Check the picture to understand where it's located in Google settings.
+<img width="1582" height="916" alt="image" src="https://github.com/user-attachments/assets/d0b94fa5-6b76-42a2-b38e-36bbcf22dd59" />
+
+
