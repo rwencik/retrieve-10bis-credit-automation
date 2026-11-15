@@ -1,18 +1,20 @@
-import pickle
+import argparse
 import logging
 import requests
 import smtplib
-from email.message import EmailMessage
 import os
+import pickle
+import re
+import traceback
+from pathlib import Path
+from email.message import EmailMessage
 
-logger = logging.getLogger('10bis_charger')
-logging.basicConfig(format='%(asctime)s %(message)s', level=logging.INFO,
-                    handlers=[logging.FileHandler('10bis_charger.log', 'a', 'utf-8'),logging.StreamHandler()])
+BASE_DIR = Path(__file__).resolve().parent
+COOKIES_DIR = BASE_DIR / "cookies"
 
-session = requests.Session()
-cookie_path = 'cookie.pkl'
-email_password = os.getenv('EMAIL_PASSWORD', '<set your email password here>')
-
+EMAIL_ADDRESS = "<your-email>"
+EMAIL_PASSWORD = os.getenv('EMAIL_PASSWORD', '<email-password>')
+REQUEST_TIMEOUT = 30
 
 BASE_HEADERS = {
     "x-app-type": "web",
@@ -21,162 +23,394 @@ BASE_HEADERS = {
     "Origin": "https://www.10bis.co.il",
 }
 
-def send(body):
-    msg = EmailMessage()
-    msg.set_content(body)
-    msg['Subject'] = 'Automated Alert'
-    msg['From'] = '<email_address>'
-    msg['To'] = '<email_address>'
+logging.basicConfig(
+    format="%(asctime)s %(message)s",
+    level=logging.INFO,
+    handlers=[
+        logging.FileHandler(
+            BASE_DIR / "10bis_charger.log", encoding="utf-8"
+        ),
+        logging.StreamHandler(),
+    ],
+)
 
-    try:
-        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
-            server.login('<email_address>', email_password)
-            server.send_message(msg)
-    except Exception as e:
-        print(f"Failed: {e}")
+logger = logging.getLogger("10bis_charger")
 
-def save_cookies():
-    with open(cookie_path, 'wb') as f:
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Retrieve 10bis credit for a specific account"
+    )
+    parser.add_argument(
+        "--email",
+        required=True,
+        help="10bis account email",
+    )
+    parser.add_argument(
+        "--notify-email",
+        default="<your email to receive notification>",
+        help="Notification recipient",
+    )
+    return parser.parse_args()
+
+
+def get_cookie_path(email):
+    email = email.strip().lower()
+
+    if not re.fullmatch(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+", email):
+        raise ValueError("Invalid account email")
+
+    account_dir = COOKIES_DIR / email
+    account_dir.mkdir(parents=True, exist_ok=True)
+    account_dir.chmod(0o700)
+
+    return account_dir / "cookie.pkl"
+
+
+def save_cookies(session, cookie_path):
+    temp_path = cookie_path.with_suffix(".tmp")
+
+    with open(temp_path, "wb") as f:
+        os.chmod(temp_path, 0o600)
         pickle.dump(session.cookies, f)
 
+    os.replace(temp_path, cookie_path)
+    logger.info("Cookies saved for %s", cookie_path.parent.name)
 
-def login_flow(email_address):
-    logging.info(f'Starting login flow for {email_address}')
-    url = "https://www.10bis.co.il/NextApi/GetUserAuthenticationDataAndSendAuthenticationCodeToUser"
+
+def load_cookies(session, cookie_path):
+    with open(cookie_path, "rb") as f:
+        session.cookies.update(pickle.load(f))
+
+    logger.info("Cookies loaded for %s", cookie_path.parent.name)
+
+
+def send(body, recipient, subject="10bis Charger Alert"):
+    if not EMAIL_PASSWORD:
+        logger.error("EMAIL_PASSWORD is not configured")
+        return
+
+    msg = EmailMessage()
+    msg.set_content(body)
+    msg["Subject"] = subject
+    msg["From"] = EMAIL_ADDRESS
+    msg["To"] = recipient
+
+    try:
+        with smtplib.SMTP_SSL(
+            "smtp.gmail.com", 465, timeout=30
+        ) as server:
+            server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
+            server.send_message(msg)
+
+        logger.info("Notification email sent to %s", recipient)
+
+    except Exception:
+        logger.exception("FAILED TO SEND NOTIFICATION EMAIL")
+
+
+
+def login_flow(session, email):
+    logger.info("Starting login flow for %s", email)
+
+    url = (
+        "https://www.10bis.co.il/NextApi/"
+        "GetUserAuthenticationDataAndSendAuthenticationCodeToUser"
+    )
+
     payload = {
         "culture": "he-IL",
         "uiCulture": "he",
-        "email": email_address
+        "email": email,
     }
-    response = session.post(url, headers=BASE_HEADERS, json=payload)
+
+    response = session.post(
+        url,
+        headers=BASE_HEADERS,
+        json=payload,
+        timeout=REQUEST_TIMEOUT,
+    )
+
+    response.raise_for_status()
+
     data = response.json()
-    if data.get('Success'):
-        logging.info('Email verified successfully')
-        auth_data = data['Data']['codeAuthenticationData']
-        return data['ShoppingCartGuid'], auth_data['authenticationToken']
-    else:
-        logging.error(f"Login failed, {response.status_code} {response.text}")
-        return False, None
+
+    if not data.get("Success"):
+        raise RuntimeError(
+            f"Login failed: HTTP {response.status_code}"
+        )
+
+    auth_data = data["Data"]["codeAuthenticationData"]
+
+    return (
+        data["ShoppingCartGuid"],
+        auth_data["authenticationToken"],
+    )
 
 
-def generate_token(auth_code, auth_token, shopping_guid, email_address):
-    logging.info('Generating Token')
+def generate_token(
+    session, auth_code, auth_token,
+    shopping_guid, email, cookie_path
+):
+    logger.info("Generating token for %s", email)
+
     url = "https://www.10bis.co.il/NextApi/GetUserV2"
-    data = {
+
+    payload = {
         "shoppingCartGuid": shopping_guid,
+
         "culture": "he-IL",
         "uiCulture": "he",
-        "email": email_address,
+        "email": email,
         "authenticationToken": auth_token,
-        "authenticationCode": auth_code
+        "authenticationCode": auth_code,
     }
-    response = session.post(url, headers=BASE_HEADERS, json=data)
+
+    response = session.post(
+        url,
+        headers=BASE_HEADERS,
+        json=payload,
+        timeout=REQUEST_TIMEOUT,
+    )
+    response.raise_for_status()
+
     data = response.json()
-    if data.get('Success'):
-        session_token = data['Data']['sessionToken']
-        logging.info(f'Success, session token: {session_token}')
-        save_cookies()
-        return session_token
-    else:
-        logging.error(f"Token generation failed: {response.status_code} {response.text}")
-        return False
+
+    if not data.get("Success"):
+        raise RuntimeError("Token generation failed")
+
+    session_token = data["Data"]["sessionToken"]
+
+    logger.info("Session token generated successfully")
+
+    save_cookies(session, cookie_path)
+
+    return session_token
 
 
-def refresh_token():
-    logging.info('Refreshing Token')
-    url = "https://api.10bis.co.il/api/v1/Authentication/RefreshToken"
-    response = session.post(url, headers=BASE_HEADERS)
-    if response.status_code == 200:
-        save_cookies()
-        return True
-    else:
-        logging.error(f"Token Refreshing failed: {response.status_code} {response.text}")
-        return False
+def refresh_token(session, cookie_path):
+    logger.info("Refreshing token")
 
 
-def get_credit_cards():
-    logging.info('Resolving credit card list')
+    url = (
+        "https://api.10bis.co.il/api/v1/"
+        "Authentication/RefreshToken"
+    )
+
+    response = session.post(
+        url,
+        headers=BASE_HEADERS,
+        timeout=REQUEST_TIMEOUT,
+    )
+
+    response.raise_for_status()
+
+    save_cookies(session, cookie_path)
+
+    logger.info("Token refreshed successfully")
+
+
+def get_credit_cards(session):
+    logger.info("Resolving credit card list")
+
     url = "https://www.10bis.co.il/NextApi/UserTransactionsReport"
-    data = {
+
+    payload = {
         "culture": "he-IL",
         "uiCulture": "he",
-        "dateBias": "0"
+        "dateBias": "0",
     }
-    response = session.post(url, headers=BASE_HEADERS, json=data)
-    if not response.ok:
-        logging.error('The cookie tasted terrible!')
+
+    response = session.post(
+        url,
+        headers=BASE_HEADERS,
+        json=payload,
+        timeout=REQUEST_TIMEOUT,
+    )
+
+    response.raise_for_status()
     data = response.json()
-    if data.get('Success'):
-        for credit_card in data['Data']['moneycards']:
-            card_id = credit_card['moneycardId']
-            logging.info(f'Checking card #{card_id}')
-            conversion = credit_card.get('tenbisCreditConversion', {})
-            if conversion.get('isEnabled'):
-                amount = conversion.get("availableAmount", 0)
-                logging.info(f'{card_id} can be charged in ₪{amount}')
+
+    if not data.get("Success"):
+        raise RuntimeError(
+            "UserTransactionsReport returned failure"
+        )
+
+    moneycards = data.get("Data", {}).get("moneycards", [])
+
+    for credit_card in moneycards:
+        card_id = credit_card["moneycardId"]
+
+        logger.info("Checking card #%s", card_id)
+
+        conversion = credit_card.get(
+            "tenbisCreditConversion", {}
+        )
+
+        if conversion.get("isEnabled"):
+            amount = conversion.get("availableAmount", 0)
+
+            if amount > 0:
+                logger.info(
+                    "Card %s can be charged in ₪%s",
+                    card_id, amount
+                )
                 return card_id, amount
-    logging.error('No eligible credit cards found')
-    return False, 0
+
+    logger.info("No eligible chargeable amount found")
+    return None, 0
 
 
-def card_charge(card_id, amount):
-    logging.info(f'Charging card_id #{card_id} with ₪{amount}')
-    url = "https://api.10bis.co.il/api/v1/Payments/LoadTenbisCredit"
+def card_charge(session, card_id, amount):
+    logger.info(
+        "Charging card_id #%s with ₪%s",
+        card_id, amount
+    )
+
+    url = (
+        "https://api.10bis.co.il/api/v1/"
+        "Payments/LoadTenbisCredit"
+    )
 
     options_headers = {
         "Host": "api.10bis.co.il",
         "Connection": "keep-alive",
         "Accept": "*/*",
         "Access-Control-Request-Method": "PATCH",
-        "Access-Control-Request-Headers": "content-type,language,x-app-type",
+        "Access-Control-Request-Headers":
+            "content-type,language,x-app-type",
         "Origin": "https://www.10bis.co.il",
         "User-Agent": "Mozilla/5.0",
         "Sec-Fetch-Mode": "cors",
         "Sec-Fetch-Site": "same-site",
         "Sec-Fetch-Dest": "empty",
         "Accept-Encoding": "gzip, deflate, br, zstd",
-        "Accept-Language": "en,he;q=0.9,en-US;q=0.8,und;q=0.7"
+        "Accept-Language": "en,he;q=0.9,en-US;q=0.8",
     }
-    session.options(url, headers=options_headers)
+
+    options_response = session.options(
+        url,
+        headers=options_headers,
+        timeout=REQUEST_TIMEOUT,
+    )
+    options_response.raise_for_status()
 
     patch_headers = {
         **BASE_HEADERS,
-        "language": "he"
+        "language": "he",
     }
-    data = {
+
+    payload = {
         "amount": amount,
-        "moneycardIdToCharge": card_id
+        "moneycardIdToCharge": card_id,
     }
-    response = session.patch(url, headers=patch_headers, json=data)
-    if response.status_code == 200:
-        logging.info('Charge successfully!')
-        return "Charge successfully!"
-    else:
-        logging.error(f"Charge failed: {response.status_code} {response.text}")
-        return f"Charge failed with status code {response.status_code}: {response.text}"
+
+    response = session.patch(
+        url,
+        headers=patch_headers,
+        json=payload,
+        timeout=REQUEST_TIMEOUT,
+    )
+
+    response.raise_for_status()
+
+    logger.info("Charge request successful")
+
+    return (
+        f"Successfully submitted charge of ₪{amount} "
+        f"to card #{card_id}"
+    )
 
 
-if __name__ == '__main__':
+def main(args):
+    email = args.email.strip().lower()
+    cookie_path = get_cookie_path(email)
+
+    logger.info("Processing 10bis account: %s", email)
+
+    with requests.Session() as session:
+
+        if cookie_path.exists():
+            load_cookies(session, cookie_path)
+
+            try:
+                refresh_token(session, cookie_path)
+
+            except requests.RequestException as e:
+                raise RuntimeError(
+                    f"Token refresh failed for {email}. "
+                    "Cookies may have expired. "
+                    "Run the script interactively after "
+                    "removing this account's cookie file."
+                ) from e
+
+        else:
+            logger.info("No saved cookies for %s", email)
+
+            if not os.isatty(0):
+                raise RuntimeError(
+                    f"No cookies for {email}. "
+                    "Run interactively to authenticate first."
+                )
+
+            shopping_guid, token = login_flow(
+                session, email
+            )
+
+            code = input("Insert SMS verification code:\n")
+
+            generate_token(
+                session,
+                code,
+                token,
+                shopping_guid,
+                email,
+                cookie_path,
+            )
+
+        card_id, available_amount = get_credit_cards(
+            session
+        )
+
+        if card_id is not None and available_amount > 0:
+            return card_charge(
+                session, card_id, available_amount
+            )
+
+        return "No chargeable amount found"
+
+
+if __name__ == "__main__":
+    args = parse_args()
+
     try:
-        with open(cookie_path, 'rb') as d:
-            session.cookies.update(pickle.load(d))
-            refresh_token()
-    except FileNotFoundError:
-        logging.info("Cookie jar is empty!")
-        email = input('Insert Email address:\n')
-        shopping_guid, token = login_flow(email)
-        if not token:
-            exit(1)
-        code = input('Insert SMS verification code:\n')
-        session_token = generate_token(code, token, shopping_guid, email)
-        if not session_token:
-            exit(1)
+        result = main(args)
 
-    card_id, available_amount = get_credit_cards()
-    if available_amount > 0:
-        response = card_charge(card_id, available_amount)
-        send(response)
-        logging.info(f'Charge response: {response}')
-    else:
-        send("No chargeable amount found")
-        logging.info('No chargeable amount found')
+        logger.info("[%s] %s", args.email, result)
+
+        send(
+            f"Account: {args.email}\n\n{result}",
+            args.notify_email,
+            subject=f"10bis Charger - SUCCESS - {args.email}",
+        )
+
+    except Exception as e:
+        logger.exception(
+            "10bis charger failed for %s", args.email
+        )
+
+        error_message = (
+            f"10bis charger FAILED.\n"
+            f"Account: {args.email}\n\n"
+            f"Error type: {type(e).__name__}\n"
+            f"Error: {e}\n\n"
+            f"Traceback:\n{traceback.format_exc()}"
+        )
+
+        send(
+            error_message,
+            args.notify_email,
+            subject=f"10bis Charger - FAILED - {args.email}",
+        )
+
+        raise SystemExit(1)
